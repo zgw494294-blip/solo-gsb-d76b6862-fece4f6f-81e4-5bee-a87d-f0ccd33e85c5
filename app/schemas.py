@@ -92,7 +92,6 @@ class CompletionRequest(DeadlockRequest):
     required_transition_ids: Annotated[list[NonEmptyId], Field(min_length=0, max_length=6)] = Field(
         default_factory=list
     )
-
     @model_validator(mode="after")
     def validate_required_transition_ids(self) -> Self:
         if len(set(self.required_transition_ids)) != len(self.required_transition_ids):
@@ -118,6 +117,11 @@ class DeactivationRequest(DeadlockRequest):
         if unknown:
             raise ValueError(f"unknown removable_transition_ids: {unknown}")
         return self
+
+
+# The completion-guarantee endpoint accepts the existing protocol request
+# unchanged; an alias keeps the endpoint self-documenting.
+GuaranteeRequest = DeadlockRequest
 
 
 class StateView(BaseModel):
@@ -167,3 +171,29 @@ class DeactivationResponse(BaseModel):
     solvable: bool
     deactivated_transition_ids: list[str] | None = None
     reachable_configurations: int | None = None
+
+
+class DeadlockWitness(BaseModel):
+    kind: Literal["deadlock"]
+    deadlock_state: ConfigurationView
+    path: list[PathStep]
+
+
+class CycleWitness(BaseModel):
+    kind: Literal["cycle"]
+    entry_state: ConfigurationView
+    prefix: list[PathStep]
+    cycle: list[PathStep]
+
+
+GuaranteeWitness = Annotated[
+    Union[DeadlockWitness, CycleWitness],
+    Field(discriminator="kind"),
+]
+
+
+class GuaranteeResponse(BaseModel):
+    result: Literal["guaranteed", "deadlock", "cycle"]
+    visited_states: int
+    initial: ConfigurationView
+    witness: GuaranteeWitness | None = None

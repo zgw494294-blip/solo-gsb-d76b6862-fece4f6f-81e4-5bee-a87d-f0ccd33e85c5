@@ -151,36 +151,66 @@ def apply_transition(configuration: Configuration, transition: Transition) -> Co
     )
 
 
-def analyze(request) -> dict:
-    model = build_model(request)
+def _explore_reachable(
+    model: ProtocolModel,
+    outgoing=None,
+) -> tuple[
+    dict[Configuration, list[tuple[Transition, Configuration]]],
+    list[Configuration],
+    dict[Configuration, tuple[Configuration | None, Transition | None]],
+    Configuration | None,
+]:
+    """BFS over every reachable configuration.
 
-    # BFS visits configurations in shortest-path order. Successors are generated
-    # in transition-id order, so the first deadlock reached is the required tie-break.
-    queue = deque([model.initial])
+    Returns the labelled adjacency (completion and deadlock configurations keep
+    empty successor lists), configurations in discovery order, the BFS parent of
+    each configuration, and the first deadlock reached.
+
+    Configurations are dequeued in shortest-path order; successors are generated
+    in transition-id order, so both the first deadlock and the lexicographic
+    tie-break match the required BFS policy.
+    """
+    if outgoing is None:
+        outgoing = model.outgoing
+
+    adjacency: dict[Configuration, list[tuple[Transition, Configuration]]] = {
+        model.initial: []
+    }
+    order: list[Configuration] = []
     parents: dict[Configuration, tuple[Configuration | None, Transition | None]] = {
         model.initial: (None, None)
     }
+    queue = deque([model.initial])
     deadlock: Configuration | None = None
 
     while queue:
         current = queue.popleft()
+        order.append(current)
 
         if is_completion(current, model.finals):
             # Completion configurations are never expanded.
             continue
 
-        enabled = enabled_transitions(current, model.outgoing)
-
-        if not enabled:
-            if deadlock is None:
-                deadlock = current
-            continue
-
-        for transition in enabled:
+        edges = []
+        for transition in enabled_transitions(current, outgoing):
             nxt = apply_transition(current, transition)
+            edges.append((transition, nxt))
             if nxt not in parents:
+                adjacency.setdefault(nxt, [])
                 parents[nxt] = (current, transition)
                 queue.append(nxt)
+        adjacency[current] = edges
+
+        if not edges and deadlock is None:
+            deadlock = current
+
+    return adjacency, order, parents, deadlock
+
+
+def analyze(request) -> dict:
+    model = build_model(request)
+
+    adjacency, _order, parents, deadlock = _explore_reachable(model)
 
     response = {
         "deadlock": deadlock is not None,
@@ -192,24 +222,63 @@ def analyze(request) -> dict:
 
     if deadlock is not None:
         chain = _rebuild_chain(parents, deadlock, configuration_of=lambda node: node)
-
-        steps = [
-            {
-                "index": index,
-                "transition_id": transition.id,
-                "from": transition.sender,
-                "to": transition.receiver,
-                "action": transition.action,
-                "message": transition.message,
-                **_configuration_view(configuration),
-            }
-            for index, (configuration, transition) in enumerate(chain, start=1)
-        ]
+        steps = _steps_view(chain)
 
         response["deadlock_state"] = _configuration_view(deadlock)
         response["path"] = steps
 
     return response
+
+
+def analyze_guarantee(request) -> dict:
+    """Completion guarantee over every interleaving of the existing protocol.
+
+    Completion is guaranteed only when every run ends in a completion
+    configuration (both endpoints final, both queues empty). A reachable
+    configuration without enabled transitions outside completion is a deadlock;
+    otherwise, if some reachable configuration lies on a directed cycle, that
+    cycle can be repeated forever (its exits towards completion do not remove
+    the infinite run). Deadlocks take precedence over cycles.
+    """
+    model = build_model(request)
+
+    adjacency, order, parents, deadlock = _explore_reachable(model)
+
+    response = {
+        "result": "guaranteed",
+        "visited_states": len(adjacency),
+        "initial": _configuration_view(model.initial),
+        "witness": None,
+    }
+
+    if deadlock is not None:
+        chain = _rebuild_chain(parents, deadlock, configuration_of=lambda node: node)
+        response["result"] = "deadlock"
+        response["witness"] = {
+            "kind": "deadlock",
+            "deadlock_state": _configuration_view(deadlock),
+            "path": _steps_view(chain),
+        }
+        return response
+
+    cyclic = _cyclic_configurations(adjacency)
+    if cyclic:
+        # Discovery order makes the prefix shortest, and equal lengths break
+        # towards the lexicographically smallest transition-id sequence.
+        entry = next(configuration for configuration in order if configuration in cyclic)
+        prefix = _rebuild_chain(parents, entry, configuration_of=lambda node: node)
+        cycle_chain = _shortest_cycle(adjacency, entry)
+        response["result"] = "cycle"
+        response["witness"] = {
+            "kind": "cycle",
+            "entry_state": _configuration_view(entry),
+            "prefix": _steps_view(prefix),
+            "cycle": _steps_view(cycle_chain),
+        }
+        return response
+
+    return response
+
 
 
 def plan_completion(request) -> dict:
@@ -255,19 +324,7 @@ def plan_completion(request) -> dict:
 
     if goal is not None:
         chain = _rebuild_chain(parents, goal, configuration_of=lambda node: node[0])
-        steps = [
-            {
-                "index": index,
-                "transition_id": transition.id,
-                "from": transition.sender,
-                "to": transition.receiver,
-                "action": transition.action,
-                "message": transition.message,
-                **_configuration_view(configuration),
-            }
-            for index, (configuration, transition) in enumerate(chain, start=1)
-        ]
-        response["path"] = steps  # [] when the initial configuration already satisfies
+        response["path"] = _steps_view(chain)  # [] when the initial configuration already satisfies
 
     return response
 
@@ -350,6 +407,122 @@ def _all_reach_completion(adjacency, finals) -> bool:
                 stack.append(previous)
 
     return len(good) == len(adjacency)
+
+
+def _cyclic_configurations(
+    adjacency: dict[Configuration, list[tuple[Transition, Configuration]]],
+) -> set[Configuration]:
+    """Configurations that belong to a directed cycle (including self-loops).
+
+    Such a configuration starts an infinite run: the cycle can be repeated
+    forever even when it has an exit towards completion.
+    """
+    reverse: dict[Configuration, list[Configuration]] = {configuration: [] for configuration in adjacency}
+    for current, edges in adjacency.items():
+        for _transition, nxt in edges:
+            reverse[nxt].append(current)
+
+    # Iterative Kosaraju; configurations carry no meaningful order here.
+    visited: set[Configuration] = set()
+    finish_order: list[Configuration] = []
+    for start in adjacency:
+        if start in visited:
+            continue
+        visited.add(start)
+        stack: list[tuple[Configuration, int]] = [(start, 0)]
+        while stack:
+            current, edge_index = stack[-1]
+            successors = adjacency[current]
+            if edge_index < len(successors):
+                stack[-1] = (current, edge_index + 1)
+                nxt = successors[edge_index][1]
+                if nxt not in visited:
+                    visited.add(nxt)
+                    stack.append((nxt, 0))
+            else:
+                finish_order.append(current)
+                stack.pop()
+
+    cyclic: set[Configuration] = set()
+    assigned: set[Configuration] = set()
+    for start in reversed(finish_order):
+        if start in assigned:
+            continue
+        component = [start]
+        assigned.add(start)
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            for previous in reverse[current]:
+                if previous not in assigned:
+                    assigned.add(previous)
+                    component.append(previous)
+                    stack.append(previous)
+        has_self_loop = any(
+            nxt is node for node in component for _transition, nxt in adjacency[node]
+        )
+        if len(component) > 1 or has_self_loop:
+            cyclic.update(component)
+
+    return cyclic
+
+
+def _shortest_cycle(
+    adjacency: dict[Configuration, list[tuple[Transition, Configuration]]],
+    entry: Configuration,
+) -> list[tuple[Configuration, Transition]]:
+    """Shortest non-empty walk from ``entry`` back to itself.
+
+    Edge lists are already transition-id sorted, so ties resolve to the
+    lexicographically smallest transition-id sequence.
+    """
+    # (predecessor, transition taken); the entry starts unvisited so its own
+    # self-loop (or any other edge returning to it) closes the cycle.
+    parents: dict[Configuration, tuple[Configuration, Transition | None]] = {}
+    queue = deque([entry])
+    closing: tuple[Transition, Configuration] | None = None
+
+    while queue and closing is None:
+        current = queue.popleft()
+        for transition, nxt in adjacency[current]:
+            if nxt == entry:
+                closing = (transition, current)
+                break
+            if nxt not in parents:
+                parents[nxt] = (current, transition)
+                queue.append(nxt)
+
+    if closing is None:
+        raise RuntimeError("entry configuration is not on a cycle")
+
+    transition, predecessor = closing
+
+    # Walk from the predecessor back to the entry, then append the closing edge.
+    chain: list[tuple[Configuration, Transition]] = []
+    cursor: Configuration | None = predecessor
+    while cursor is not None and cursor in parents:
+        previous, edge = parents[cursor]
+        chain.append((cursor, edge))
+        cursor = previous
+    chain.reverse()
+    chain.append((entry, transition))
+    return chain
+
+
+def _steps_view(chain: list[tuple[Configuration, Transition]]) -> list[dict]:
+    """Numbered transition records; numbering restarts at 1 for each witness part."""
+    return [
+        {
+            "index": index,
+            "transition_id": transition.id,
+            "from": transition.sender,
+            "to": transition.receiver,
+            "action": transition.action,
+            "message": transition.message,
+            **_configuration_view(configuration),
+        }
+        for index, (configuration, transition) in enumerate(chain, start=1)
+    ]
 
 
 def _rebuild_chain(parents, target, configuration_of) -> list[tuple[Configuration, Transition]]:

@@ -1,6 +1,6 @@
-# 离线双端消息协议死锁分析 API
+# 离线双端消息协议分析 API
 
-基于 Python + FastAPI，对 A、B 两端的 send/receive 状态机做离线可达性分析。服务完全离线运行，不依赖数据库或外部服务。
+基于 Python + FastAPI，对 A、B 两端的 send/receive 状态机做离线可达性分析，包括死锁检测、完成保证、完成计划与最小停用方案。服务完全离线运行，不依赖数据库或外部服务。
 
 ## 协议模型
 
@@ -159,6 +159,186 @@ curl -X POST http://localhost:8000/v1/deadlocks \
   },
   "deadlock_state": null,
   "path": null
+}
+```
+
+## 完成保证：`POST /v1/completion-guarantees`
+
+接收与死锁分析**完全相同的协议请求**（不增加任何字段），对从初态出发、按一格队列规则产生的所有可执行转移交错做判定：
+
+- 只有**每次运行都结束于完成配置**（两端均处终态且两个队列都为空，完成配置不再扩展）才算保证完成；
+- 运行可能停在完成配置之外、且没有任何可执行转移的配置时，报告 **deadlock**；
+- 否则存在可达配置位于有向环上、从而可以无限重复时，报告 **cycle**；即使该循环存在通往完成的出口，也必须报告；
+- 死锁与循环并存时，优先报告死锁。
+
+响应字段：
+
+- `result`：`"guaranteed"`、`"deadlock"`、`"cycle"` 之一；
+- `visited_states`：访问过的不同配置数（含完成配置）；
+- `initial`：初态视图；
+- `witness`：保证完成时为 `null`；否则为见证对象：
+  - 死锁见证：`kind` 为 `"deadlock"`，`deadlock_state` 为死锁配置，`path` 是从初态到该配置的最短路径（同长度按转移 ID 序列字典序）；
+  - 循环见证：`kind` 为 `"cycle"`，`entry_state` 为循环入口配置，`prefix` 是从初态到入口的路径（入口即初态时为 `[]`），`cycle` 是从入口出发并回到入口的非空循环。
+
+`prefix` 与 `cycle` 中的每一步都逐步列出 `transition_id`、`from`、`to`、`action`、`message` 以及执行后的两端状态与队列；两部分各自从 `index: 1` 重新编号。
+
+### 可执行调用示例：存在循环（且循环有通往完成的出口）
+
+```bash
+curl -X POST http://localhost:8000/v1/completion-guarantees \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "A": {
+      "states": [0, 1],
+      "initial": 0,
+      "finals": [1]
+    },
+    "B": {
+      "states": [0, 1],
+      "initial": 0,
+      "finals": [1]
+    },
+    "transitions": [
+      {
+        "id": "t1",
+        "from": "A",
+        "to": "B",
+        "action": "send",
+        "message": "m",
+        "source": 0,
+        "target": 0
+      },
+      {
+        "id": "t2",
+        "from": "A",
+        "to": "B",
+        "action": "receive",
+        "message": "m",
+        "source": 0,
+        "target": 0
+      },
+      {
+        "id": "t3",
+        "from": "A",
+        "to": "B",
+        "action": "send",
+        "message": "f",
+        "source": 0,
+        "target": 1
+      },
+      {
+        "id": "t4",
+        "from": "A",
+        "to": "B",
+        "action": "receive",
+        "message": "f",
+        "source": 0,
+        "target": 1
+      }
+    ]
+  }'
+```
+
+该协议在初态可反复执行 `t1, t2` 回到自身（无限运行），也可执行 `t3, t4` 到达完成配置；由于存在无限运行，结果为 `cycle`：
+
+```json
+{
+  "result": "cycle",
+  "visited_states": 4,
+  "initial": {
+    "state": { "A": 0, "B": 0 },
+    "queues": { "A_to_B": null, "B_to_A": null }
+  },
+  "witness": {
+    "kind": "cycle",
+    "entry_state": {
+      "state": { "A": 0, "B": 0 },
+      "queues": { "A_to_B": null, "B_to_A": null }
+    },
+    "prefix": [],
+    "cycle": [
+      {
+        "index": 1,
+        "transition_id": "t1",
+        "from": "A",
+        "to": "B",
+        "action": "send",
+        "message": "m",
+        "state": { "A": 0, "B": 0 },
+        "queues": { "A_to_B": "m", "B_to_A": null }
+      },
+      {
+        "index": 2,
+        "transition_id": "t2",
+        "from": "A",
+        "to": "B",
+        "action": "receive",
+        "message": "m",
+        "state": { "A": 0, "B": 0 },
+        "queues": { "A_to_B": null, "B_to_A": null }
+      }
+    ]
+  }
+}
+```
+
+### 保证完成时的响应
+
+例如只有一次发送并被消费的协议（A 经 `send` 到终态，B 经 `receive` 到终态）：
+
+```json
+{
+  "result": "guaranteed",
+  "visited_states": 3,
+  "initial": {
+    "state": { "A": 0, "B": 0 },
+    "queues": { "A_to_B": null, "B_to_A": null }
+  },
+  "witness": null
+}
+```
+
+### 死锁时的响应
+
+存在死锁时（即使同时存在循环），`result` 为 `"deadlock"`，`witness.kind` 为 `"deadlock"`，并返回通往该配置的最短路径，例如本文开头死锁协议的响应：
+
+```json
+{
+  "result": "deadlock",
+  "visited_states": 5,
+  "initial": {
+    "state": { "A": 0, "B": 0 },
+    "queues": { "A_to_B": null, "B_to_A": null }
+  },
+  "witness": {
+    "kind": "deadlock",
+    "deadlock_state": {
+      "state": { "A": 1, "B": 1 },
+      "queues": { "A_to_B": "m", "B_to_A": "x" }
+    },
+    "path": [
+      {
+        "index": 1,
+        "transition_id": "t1",
+        "from": "A",
+        "to": "B",
+        "action": "send",
+        "message": "m",
+        "state": { "A": 1, "B": 0 },
+        "queues": { "A_to_B": "m", "B_to_A": null }
+      },
+      {
+        "index": 2,
+        "transition_id": "t2",
+        "from": "B",
+        "to": "A",
+        "action": "send",
+        "message": "x",
+        "state": { "A": 1, "B": 1 },
+        "queues": { "A_to_B": "m", "B_to_A": "x" }
+      }
+    ]
+  }
 }
 ```
 
@@ -377,6 +557,8 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 - 不同消息种类超过 8；
 - `from`、`to`、`action` 取值非法，或两端相同；
 - 请求中出现未定义字段、空 ID/消息等越界输入。
+
+`POST /v1/completion-guarantees` 直接复用上述通用校验（请求体与死锁分析完全一致，不接受额外字段）。
 
 `POST /v1/completion-plans` 在上述规则之外，以下情况同样返回 `422 Unprocessable Entity`：
 
