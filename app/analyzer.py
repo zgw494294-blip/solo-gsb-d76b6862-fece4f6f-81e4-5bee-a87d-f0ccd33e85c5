@@ -192,22 +192,8 @@ def analyze(request) -> dict:
 
     if deadlock is not None:
         chain = _rebuild_chain(parents, deadlock, configuration_of=lambda node: node)
-
-        steps = [
-            {
-                "index": index,
-                "transition_id": transition.id,
-                "from": transition.sender,
-                "to": transition.receiver,
-                "action": transition.action,
-                "message": transition.message,
-                **_configuration_view(configuration),
-            }
-            for index, (configuration, transition) in enumerate(chain, start=1)
-        ]
-
         response["deadlock_state"] = _configuration_view(deadlock)
-        response["path"] = steps
+        response["path"] = _steps_view(chain)
 
     return response
 
@@ -255,19 +241,7 @@ def plan_completion(request) -> dict:
 
     if goal is not None:
         chain = _rebuild_chain(parents, goal, configuration_of=lambda node: node[0])
-        steps = [
-            {
-                "index": index,
-                "transition_id": transition.id,
-                "from": transition.sender,
-                "to": transition.receiver,
-                "action": transition.action,
-                "message": transition.message,
-                **_configuration_view(configuration),
-            }
-            for index, (configuration, transition) in enumerate(chain, start=1)
-        ]
-        response["path"] = steps  # [] when the initial configuration already satisfies
+        response["path"] = _steps_view(chain)  # [] when the initial configuration already satisfies
 
     return response
 
@@ -350,6 +324,211 @@ def _all_reach_completion(adjacency, finals) -> bool:
                 stack.append(previous)
 
     return len(good) == len(adjacency)
+
+
+def analyze_guarantee(request) -> dict:
+    """Decide whether every run from the initial configuration finishes at completion.
+
+    A run stops at a completion configuration (both endpoints final, both queues
+    empty); those are never expanded. The protocol is guaranteed to complete only
+    when no run can stop at a non-completion sink (deadlock) and no infinite run
+    exists. In the finite reachable graph an infinite run is exactly a reachable
+    directed cycle over non-completion configurations, which is reported even
+    when the cycle has an exit that leads to completion. Deadlocks take
+    precedence over cycles when both exist.
+    """
+    model = build_model(request)
+
+    # BFS over the whole reachable space. Successors are generated in
+    # transition-id order, so parent paths are shortest and ties resolve to the
+    # lexicographically smallest transition-id sequence. Configurations are
+    # dequeued in the same order, fixing both the deadlock tie-break and the
+    # tie-break for which cycling configuration gets reported.
+    adjacency: dict[Configuration, list[tuple[Transition, Configuration]]] = {
+        model.initial: []
+    }
+    parents: dict[Configuration, tuple[Configuration | None, Transition | None]] = {
+        model.initial: (None, None)
+    }
+    order: list[Configuration] = []
+    queue = deque([model.initial])
+    deadlock: Configuration | None = None
+
+    while queue:
+        current = queue.popleft()
+        order.append(current)
+
+        if is_completion(current, model.finals):
+            # Completion configurations are never expanded.
+            continue
+
+        successors = []
+        for transition in enabled_transitions(current, model.outgoing):
+            nxt = apply_transition(current, transition)
+            successors.append((transition, nxt))
+            if nxt not in parents:
+                parents[nxt] = (current, transition)
+                adjacency.setdefault(nxt, [])
+                queue.append(nxt)
+        adjacency[current] = successors
+
+        if not successors and deadlock is None:
+            deadlock = current
+
+    base = {
+        "visited_states": len(adjacency),
+        "initial": _configuration_view(model.initial),
+    }
+
+    if deadlock is not None:
+        prefix = _rebuild_chain(parents, deadlock, configuration_of=lambda node: node)
+        return {
+            "result": "deadlock",
+            "guaranteed": False,
+            **base,
+            "witness": {
+                "kind": "deadlock",
+                "configuration": _configuration_view(deadlock),
+                "prefix": _steps_view(prefix),
+            },
+        }
+
+    # No deadlock: an infinite run exists iff a non-completion configuration
+    # reachable from the initial one lies on a directed cycle.
+    cycling = _configurations_on_cycles(adjacency)
+    target = next((configuration for configuration in order if configuration in cycling), None)
+
+    if target is not None:
+        prefix = _rebuild_chain(parents, target, configuration_of=lambda node: node)
+        cycle = _shortest_closed_walk(target, adjacency)
+        return {
+            "result": "cycle",
+            "guaranteed": False,
+            **base,
+            "witness": {
+                "kind": "cycle",
+                "configuration": _configuration_view(target),
+                "prefix": _steps_view(prefix),
+                "cycle": _steps_view(cycle),
+            },
+        }
+
+    return {"result": "guaranteed", "guaranteed": True, **base, "witness": None}
+
+
+def _configurations_on_cycles(
+    adjacency: dict[Configuration, list[tuple[Transition, Configuration]]],
+) -> set[Configuration]:
+    """Configurations that belong to a non-empty directed cycle (self loops included).
+
+    Iterative Kosaraju SCC decomposition on the reachable graph.
+    """
+    # First pass: finishing order via depth-first search.
+    seen: set[Configuration] = set()
+    finish: list[Configuration] = []
+    for root in adjacency:
+        if root in seen:
+            continue
+        seen.add(root)
+        stack: list[tuple[Configuration, int]] = [(root, 0)]
+        while stack:
+            current, offset = stack[-1]
+            successors = adjacency.get(current, ())
+            if offset < len(successors):
+                nxt = successors[offset][1]
+                stack[-1] = (current, offset + 1)
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append((nxt, 0))
+            else:
+                finish.append(current)
+                stack.pop()
+
+    # Second pass over the reversed graph, in reverse finishing order.
+    reverse: dict[Configuration, list[Configuration]] = {node: [] for node in adjacency}
+    self_loop: set[Configuration] = set()
+    for current, successors in adjacency.items():
+        for _, nxt in successors:
+            reverse[nxt].append(current)
+            if nxt == current:
+                self_loop.add(current)
+
+    on_cycle: set[Configuration] = set()
+    assigned: set[Configuration] = set()
+    for root in reversed(finish):
+        if root in assigned:
+            continue
+        component = []
+        stack = [root]
+        assigned.add(root)
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for previous in reverse[current]:
+                if previous not in assigned:
+                    assigned.add(previous)
+                    stack.append(previous)
+        if len(component) > 1 or (len(component) == 1 and root in self_loop):
+            on_cycle.update(component)
+
+    return on_cycle
+
+
+def _shortest_closed_walk(
+    start: Configuration,
+    adjacency: dict[Configuration, list[tuple[Transition, Configuration]]],
+) -> list[tuple[Configuration, Transition]]:
+    """Shortest non-empty walk from start back to start; smallest id sequence on ties.
+
+    Edges of every configuration are already ordered by transition id, so BFS
+    first-discovery order yields the required lexicographic tie-break.
+    """
+    for transition, nxt in adjacency.get(start, ()):
+        if nxt == start:
+            return [(start, transition)]
+
+    parents: dict[Configuration, tuple[Configuration, Transition]] = {}
+    queue = deque()
+    for transition, nxt in adjacency.get(start, ()):
+        if nxt not in parents:
+            parents[nxt] = (start, transition)
+            queue.append(nxt)
+
+    while queue:
+        current = queue.popleft()
+        if current == start:
+            break
+        for transition, nxt in adjacency.get(current, ()):
+            if nxt not in parents:
+                parents[nxt] = (current, transition)
+                queue.append(nxt)
+
+    chain: list[tuple[Configuration, Transition]] = []
+    cursor = start
+    while True:
+        previous, transition = parents[cursor]
+        chain.append((cursor, transition))
+        if previous == start:
+            break
+        cursor = previous
+    chain.reverse()
+    return chain
+
+
+def _steps_view(chain: list[tuple[Configuration, Transition]]) -> list[dict]:
+    """Serialize (destination configuration, transition) pairs as path steps."""
+    return [
+        {
+            "index": index,
+            "transition_id": transition.id,
+            "from": transition.sender,
+            "to": transition.receiver,
+            "action": transition.action,
+            "message": transition.message,
+            **_configuration_view(configuration),
+        }
+        for index, (configuration, transition) in enumerate(chain, start=1)
+    ]
 
 
 def _rebuild_chain(parents, target, configuration_of) -> list[tuple[Configuration, Transition]]:

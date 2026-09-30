@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from .analyzer import analyze, plan_completion, plan_deactivation
+from .analyzer import analyze, analyze_guarantee, plan_completion, plan_deactivation
 from .schemas import (
     CompletionRequest,
     CompletionResponse,
@@ -8,11 +8,12 @@ from .schemas import (
     DeadlockResponse,
     DeactivationRequest,
     DeactivationResponse,
+    GuaranteeResponse,
 )
 
 app = FastAPI(
     title="Offline Two-Party Message Protocol Deadlock Analyzer",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -34,3 +35,8 @@ def plan_completion_endpoint(request: CompletionRequest) -> dict:
 @app.post("/v1/deactivation-plans", response_model=DeactivationResponse)
 def plan_deactivation_endpoint(request: DeactivationRequest) -> dict:
     return plan_deactivation(request)
+
+
+@app.post("/v1/completion-guarantees", response_model=GuaranteeResponse)
+def completion_guarantee_endpoint(request: DeadlockRequest) -> dict:
+    return analyze_guarantee(request)

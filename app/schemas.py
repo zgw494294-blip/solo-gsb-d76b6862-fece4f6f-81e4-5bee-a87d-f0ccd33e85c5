@@ -167,3 +167,27 @@ class DeactivationResponse(BaseModel):
     solvable: bool
     deactivated_transition_ids: list[str] | None = None
     reachable_configurations: int | None = None
+
+
+class DeadlockWitness(BaseModel):
+    kind: Literal["deadlock"]
+    configuration: ConfigurationView
+    prefix: list[PathStep]
+
+
+class CycleWitness(BaseModel):
+    kind: Literal["cycle"]
+    configuration: ConfigurationView
+    prefix: list[PathStep]
+    cycle: list[PathStep]
+
+
+class GuaranteeResponse(BaseModel):
+    result: Literal["guaranteed", "deadlock", "cycle"]
+    guaranteed: bool
+    visited_states: int
+    initial: ConfigurationView
+    witness: Annotated[
+        Union[DeadlockWitness, CycleWitness],
+        Field(discriminator="kind"),
+    ] | None = None
